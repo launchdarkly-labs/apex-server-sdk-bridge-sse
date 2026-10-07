@@ -64,6 +64,16 @@ func newTestBridge(t *testing.T, baseURI, eventsURI string) *Bridge {
 	// never drains at all.
 	bridge.initFlushControls()
 
+	// Streaming is off here, matching the poll-driven tests this helper predates; tests
+	// of the stream turn it on. The stream state is prepared regardless so a test that
+	// does so has a client and a wake-up channel. The timings are short but positive:
+	// a zero reconnect delay would reconnect with no delay at all, and a zero read
+	// timeout means no timeout at all.
+	bridge.initFlagStream(0)
+	bridge.streamInitialReconnectDelay = time.Millisecond
+	bridge.streamReadTimeout = STREAM_READ_TIMEOUT
+	bridge.flagPushRetryDelay = time.Millisecond
+
 	return bridge
 }
 
@@ -206,9 +216,14 @@ func setMinimalBridgeEnv(t *testing.T) {
 	setEnv(t, "OAUTH_USERNAME", "test@example.invalid")
 	setEnv(t, "OAUTH_PASSWORD", "test-password")
 	setEnv(t, "OAUTH_SECRET", "test-secret")
-	for _, name := range []string{"OAUTH_JWT_KEY", "OAUTH_URI", "HTTP_TIMEOUT", "LD_BASE_URI", "LD_EVENTS_URI", "OAUTH_GRANT_TYPE", "LD_SCOPE_KEY"} {
+	for _, name := range []string{"OAUTH_JWT_KEY", "OAUTH_URI", "HTTP_TIMEOUT", "LD_BASE_URI", "LD_EVENTS_URI", "LD_STREAM_URI", "OAUTH_GRANT_TYPE", "LD_SCOPE_KEY", "STREAM_INITIAL_RECONNECT_DELAY"} {
 		unsetEnv(t, name)
 	}
+	// Polling, not the default. The tests built on this helper point launchDarklyBaseURI
+	// at a stub and drive featureLoop, and under the streaming default that loop would
+	// ignore the stub and dial the real stream host. Tests of the default itself unset
+	// this again.
+	setEnv(t, "FLAG_STREAMING", "false")
 }
 
 // TestParseDurationFromEnv covers the parsing layer on its own. An unset, empty, or

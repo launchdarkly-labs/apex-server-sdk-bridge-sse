@@ -60,12 +60,26 @@ export OAUTH_URI='YOUR OAUTH URI'
 export HTTP_TIMEOUT='Your timeout'
 # such as: '1500ms'
 # see https://golang.org/pkg/time/#ParseDuration for formatting
+# for the flag stream it bounds the connection and the wait for response headers, not
+# the stream itself -- refer to "Flag delivery" below
+export FLAG_STREAMING='Whether to stream flag data from LaunchDarkly'
+# 'true' or 'false'; if not set or not a boolean, defaults to: 'true'
+# 'true' holds a streaming connection and pushes each change as it happens
+# 'false' polls LaunchDarkly every FLAG_POLL_INTERVAL instead
+export LD_STREAM_URI='Your LaunchDarkly streaming endpoint'
+# if not set, defaults to: 'https://stream.launchdarkly.com'
+# point it at a Relay Proxy to stream from that instead
+export STREAM_INITIAL_RECONNECT_DELAY='How long to wait before the first reconnect'
+# such as: '2s'
+# if not set, unparseable, zero, or negative, defaults to: '1s'
+# each consecutive failure doubles the delay, up to 30s, with random jitter
 export EVENT_POLL_INTERVAL='How often to drain events from Salesforce'
 # such as: '10s'
 # if not set, unparseable, zero, or negative, defaults to: '30s'
 # anything under '5s' is honored but logs a warning about org-wide API limits
 export FLAG_POLL_INTERVAL='How often to poll LaunchDarkly for flag data'
 # such as: '5m'
+# only used when FLAG_STREAMING is 'false'; otherwise it is ignored and a notice is logged
 # if not set or unparseable, defaults to: '30s'
 # minimum is '30s'; anything shorter is clamped up to '30s'
 export MAX_EVENTS_PER_DRAIN='How many events one drain may take'
@@ -176,8 +190,8 @@ environment of one project. The scope key must therefore be unique for every pro
 environment pair that shares the org.
 
 Do not set it to your LaunchDarkly project key. Two environments of the same project would
-then share a scope, and each bridge's push deletes the other's flag data on every poll. The org
-would alternate between the two environments' targeting every 30 seconds, and evaluation would
+then share a scope, and each bridge's push deletes the other's flag data. The org would
+alternate between the two environments' targeting with every push, and evaluation would
 return real flag values from whichever environment pushed last. Combining both names, as in
 `gps-production`, is the simplest value that stays unique.
 
@@ -231,6 +245,88 @@ records left behind by a decommissioned bridge are not cleaned up for you. The `
 because a single DML delete is capped at 10,000 rows; repeat it, or use Batch Apex, if you have
 more than that.
 
+## Flag delivery
+
+By default the daemon **streams** flag data. It holds one long-lived connection to
+LaunchDarkly's streaming service, the same one the other server-side SDKs use, and
+LaunchDarkly pushes each change down it as the change is saved. The daemon applies the
+change to its own copy of the environment and pushes the whole set to the org, so a flag
+change reaches Salesforce in about the time one Apex REST call takes, rather than up to
+30 seconds later.
+
+```
+delivering flags by streaming from https://stream.launchdarkly.com
+connecting to the LaunchDarkly stream at: https://stream.launchdarkly.com/all
+received 12 flags and 3 segments from the LaunchDarkly stream
+pushing flags to: https://mycompany.my.salesforce.com/services/apexrest/store
+the LaunchDarkly stream updated flags "checkout-redesign" to version 14
+pushing flags to: https://mycompany.my.salesforce.com/services/apexrest/store
+```
+
+Nothing changes on the Apex side. The stream feeds the same `store` endpoint with the same
+document a poll would have pushed, so the org and the bridge can still be upgraded in
+either order.
+
+### What the stream costs
+
+Streaming replaces a poll every 30 seconds with a push per change, which for most orgs is
+far fewer Salesforce API calls: an environment whose flags change ten times a day costs ten
+inbound calls instead of 2,880. Each change is one call, however many flags it touches at
+once, because changes that arrive while a push is in flight are folded into the next push.
+
+A reconnect costs the org nothing unless something changed. Every connection opens with the
+complete flag set, and the daemon compares that against what it last pushed; after a
+network blip it finds them identical and skips the push. Only a change that happened while
+the connection was down is pushed, and it is pushed as soon as the connection is back.
+
+### When the connection drops
+
+The daemon reconnects on its own. The first attempt waits `STREAM_INITIAL_RECONNECT_DELAY`,
+one second by default, and each consecutive failure doubles the wait up to 30 seconds, with
+random jitter so a fleet of bridges does not reconnect in step. Once a connection has stayed
+up for a minute the delay resets. A connection that goes silent for five minutes is treated
+as dead and reconnected the same way -- LaunchDarkly sends a heartbeat every three minutes
+or so, so a healthy connection is never silent that long.
+
+A bridge started during a LaunchDarkly outage keeps retrying until the outage ends, rather
+than exiting. The org keeps serving whatever flag data it holds throughout.
+
+Two kinds of failure are not retried, because retrying cannot change the answer, and the
+daemon stops with an error instead:
+
+- A `401` or `403` from the stream, which means `LD_SDK_KEY` is wrong or has been revoked.
+- Any other `4xx` apart from `400`, `408` and `429`, such as the `404` a wrong
+  `LD_STREAM_URI` produces.
+
+### When Salesforce refuses a push
+
+A push the org refuses, or that never arrives, is retried: after one second, then two, then
+four, up to 30 seconds between attempts. A change that lands while a retry is waiting goes
+out at once, carrying the change, and no change is ever lost to a Salesforce outage. The
+retry stops only when a push succeeds or the daemon shuts down. This differs from polling,
+where a failed push is simply tried again on the next poll; a stream has no next poll until
+the flag changes again, so it needs its own retry.
+
+The one exception is the same one polling has: Salesforce rejecting the credential on a
+token refresh is permanent, and stops the daemon.
+
+### Polling instead
+
+Set `FLAG_STREAMING='false'` to poll as the daemon always did. Reasons to prefer it:
+
+- An egress proxy or firewall that cuts long-lived connections. The daemon survives this
+  -- every cut is a reconnect, and reconnects are cheap -- but it is noisy in the log.
+- An environment where a steady, predictable request rate matters more than latency.
+
+Under polling `FLAG_POLL_INTERVAL` applies, and `LD_STREAM_URI` and
+`STREAM_INITIAL_RECONNECT_DELAY` do not. Under streaming it is the other way round, and a
+`FLAG_POLL_INTERVAL` that is set anyway earns a notice at startup saying it has no effect.
+
+Note that `HTTP_TIMEOUT` behaves differently for the stream. For every other request it
+bounds the whole exchange, which for a stream would end the connection after 30 seconds, so
+for the stream it bounds only the connection and the wait for response headers. Silence
+after that is governed by the five-minute read timeout above.
+
 ## Polling intervals
 
 The daemon runs two independent loops, each on its own interval:
@@ -240,9 +336,11 @@ The daemon runs two independent loops, each on its own interval:
 | Events | Drains `EventData__c` from Salesforce, then posts to LaunchDarkly | `EVENT_POLL_INTERVAL` | `30s` | greater than zero |
 | Flags | Polls LaunchDarkly for flag data, then pushes it to Salesforce | `FLAG_POLL_INTERVAL` | `30s` | `30s` |
 
-Both accept any [`time.ParseDuration`](https://golang.org/pkg/time/#ParseDuration) string.
-When a variable is unset, the daemon uses the historical 30-second cadence, so an
-existing deployment behaves exactly as it did before these options were added.
+The flags row applies only when `FLAG_STREAMING` is `'false'`; refer to
+[Flag delivery](#flag-delivery). Both intervals accept any
+[`time.ParseDuration`](https://golang.org/pkg/time/#ParseDuration) string. When a variable
+is unset, the daemon uses the historical 30-second cadence, so a deployment that has
+switched back to polling behaves exactly as it did before these options were added.
 
 The daemon never refuses to start over a poll interval. Instead it falls back or clamps
 and logs the interval actually in effect, so the startup log is the authoritative record
@@ -271,8 +369,9 @@ tradeoff worth understanding before you make it.
 Every drain is one inbound Salesforce REST call, and inbound calls count against your
 org's 24-hour API request allocation. (The SOQL query and DML delete the drain performs
 run inside the Apex transaction and count against per-transaction governor limits, not
-the daily API allocation.) `FLAG_POLL_INTERVAL` contributes too, since pushing flag data
-to Salesforce is also an inbound call.
+the daily API allocation.) Flag pushes contribute too, since pushing flag data to
+Salesforce is also an inbound call -- one per change under streaming, and one per poll
+that found a change under polling.
 
 Salesforce allocates API requests per 24 hours by edition. For production orgs:
 

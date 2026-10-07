@@ -30,7 +30,13 @@ import (
 const (
 	LD_BASE_URI   = "https://sdk.launchdarkly.com"
 	LD_EVENTS_URI = "https://events.launchdarkly.com"
+	LD_STREAM_URI = "https://stream.launchdarkly.com"
 	OAUTH_URI     = "https://login.salesforce.com/services/oauth2/token"
+	// DEFAULT_STREAM_INITIAL_RECONNECT_DELAY is the first delay before the bridge
+	// reconnects a dropped stream, as accepted by STREAM_INITIAL_RECONNECT_DELAY. Each
+	// consecutive failure doubles it, up to STREAM_MAX_RETRY_DELAY. It matches the other
+	// LaunchDarkly server SDKs.
+	DEFAULT_STREAM_INITIAL_RECONNECT_DELAY = 1 * time.Second
 	// The OAuth flows the bridge can use to authenticate to Salesforce, as accepted by
 	// OAUTH_GRANT_TYPE.
 	//
@@ -131,12 +137,32 @@ type Bridge struct {
 	launchDarklyKey       string
 	launchDarklyBaseURI   string
 	launchDarklyEventsURI string
-	oauthId               string
-	oauthSecret           string
-	oauthUsername         string
-	oauthPassword         string
-	oauthCurrentToken     string
-	oauthJWTKey           *rsa.PrivateKey
+	launchDarklyStreamURI string
+	// streaming selects how flags are delivered. True, the default, holds a streaming
+	// connection to LaunchDarkly and pushes each change as it arrives; false polls
+	// launchDarklyBaseURI every flagPollInterval. Refer to stream.go.
+	streaming bool
+	// streamInitialReconnectDelay is the first delay before a dropped stream is
+	// reconnected, and streamReadTimeout is how long the stream may stay silent before
+	// it is dropped. The second always holds STREAM_READ_TIMEOUT outside of tests.
+	streamInitialReconnectDelay time.Duration
+	streamReadTimeout           time.Duration
+	// streamClient is the HTTP client the stream uses. It is separate from client because
+	// client's Timeout would end a stream after HTTP_TIMEOUT; refer to newStreamClient.
+	streamClient *http.Client
+	// flags is the bridge's copy of the environment's flag data while streaming, and
+	// flagsChanged wakes flagPushLoop when it changes. Both are unused when polling.
+	flags        flagStore
+	flagsChanged chan struct{}
+	// flagPushRetryDelay is how long flagPushLoop first waits before retrying a failed
+	// push. It always holds FLAG_PUSH_RETRY_DELAY outside of tests.
+	flagPushRetryDelay time.Duration
+	oauthId            string
+	oauthSecret        string
+	oauthUsername      string
+	oauthPassword      string
+	oauthCurrentToken  string
+	oauthJWTKey        *rsa.PrivateKey
 	// oauthGrantType is the resolved OAuth flow, always one of the GRANT_ constants.
 	oauthGrantType string
 	oauthURI       url.URL
@@ -193,6 +219,25 @@ func parseDurationFromEnv(name string, fallback time.Duration) time.Duration {
 	parsed, err := time.ParseDuration(raw)
 	if err != nil {
 		log.Printf("%s (%s) failed to parse to a duration, using %s", name, raw, fallback)
+		return fallback
+	}
+
+	return parsed
+}
+
+// parseBoolFromEnv reads a boolean the way strconv.ParseBool does, so "true", "false",
+// "1", "0", "t", "f" and their upper-case forms are all accepted. Anything else keeps
+// the fallback and says so, matching how the duration variables behave.
+func parseBoolFromEnv(name string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		log.Printf("%s is not set, using the default of %t", name, fallback)
+		return fallback
+	}
+
+	parsed, err := strconv.ParseBool(raw)
+	if err != nil {
+		log.Printf("%s (%s) is not a boolean, using %t", name, raw, fallback)
 		return fallback
 	}
 
@@ -315,6 +360,11 @@ func newBridge() (*Bridge, error) {
 	bridge.launchDarklyEventsURI = os.Getenv("LD_EVENTS_URI")
 	if bridge.launchDarklyEventsURI == "" {
 		bridge.launchDarklyEventsURI = LD_EVENTS_URI
+	}
+
+	bridge.launchDarklyStreamURI = os.Getenv("LD_STREAM_URI")
+	if bridge.launchDarklyStreamURI == "" {
+		bridge.launchDarklyStreamURI = LD_STREAM_URI
 	}
 
 	bridge.oauthId = os.Getenv("OAUTH_ID")
@@ -448,11 +498,36 @@ func newBridge() (*Bridge, error) {
 		bridge.flagPollInterval = MIN_FLAG_POLL_INTERVAL
 	}
 
+	// Streaming is the default, as it is in every other LaunchDarkly server SDK. The
+	// poll interval is still resolved above so that switching back is one variable, but
+	// an operator who set it expecting an effect is told it has none.
+	bridge.streaming = parseBoolFromEnv("FLAG_STREAMING", true)
+	if bridge.streaming {
+		if os.Getenv("FLAG_POLL_INTERVAL") != "" {
+			log.Print("FLAG_POLL_INTERVAL has no effect while FLAG_STREAMING is on; " +
+				"set FLAG_STREAMING=false to poll for flags instead")
+		}
+		log.Printf("delivering flags by streaming from %s", bridge.launchDarklyStreamURI)
+	} else {
+		log.Printf("delivering flags by polling %s every %s", bridge.launchDarklyBaseURI, bridge.flagPollInterval)
+	}
+
+	bridge.streamInitialReconnectDelay = parseDurationFromEnv("STREAM_INITIAL_RECONNECT_DELAY",
+		DEFAULT_STREAM_INITIAL_RECONNECT_DELAY)
+	if bridge.streamInitialReconnectDelay <= 0 {
+		log.Printf("%s duration (%s) is non-positive, using %s", "STREAM_INITIAL_RECONNECT_DELAY",
+			bridge.streamInitialReconnectDelay, DEFAULT_STREAM_INITIAL_RECONNECT_DELAY)
+		bridge.streamInitialReconnectDelay = DEFAULT_STREAM_INITIAL_RECONNECT_DELAY
+	}
+	bridge.streamReadTimeout = STREAM_READ_TIMEOUT
+	bridge.flagPushRetryDelay = FLAG_PUSH_RETRY_DELAY
+
 	bridge.maxEventsPerDrain = resolveMaxEventsPerDrain()
 
 	bridge.eventPushRetryDelay = EVENT_PUSH_RETRY_DELAY
 
 	bridge.initFlushControls()
+	bridge.initFlagStream(httpTimeoutDuration)
 
 	bridge.client = http.Client{
 		Timeout: httpTimeoutDuration,
@@ -1088,7 +1163,65 @@ func isHTTPErrorRecoverable(statusCode int) bool {
 	return true
 }
 
+// pushFlags sends one complete set of flag data to the org's store endpoint, which
+// replaces everything the scope held with it. Both ways of getting flag data deliver
+// through here: pollLoop with the body of a poll, flagPushLoop with a snapshot of the
+// streamed store.
+//
+// The second value reports a failure no retry of this push can fix: a URI the request
+// cannot be built from, or Salesforce rejecting the credential on a refresh. The caller
+// stops the daemon on it. Every other failure is one the next push may not see.
+//
+// The body is a bytes.Reader rather than a bytes.Buffer, because requestWithOauth can
+// send this request a second time after refreshing the token. Both give http.NewRequest
+// enough to build a GetBody, so both replay as the code stands, but only the Reader is a
+// read-only view of payload. A Buffer is a writable staging area that http.NewRequest
+// snapshots once, so a later write to it would leave the two attempts sending different
+// bytes.
+func (bridge *Bridge) pushFlags(pushURI string, payload []byte) (error, bool) {
+	pushRequest, err := http.NewRequest("POST", pushURI, bytes.NewReader(payload))
+	if err != nil {
+		// Logged as well as returned, which is not redundant. run() reads one error from
+		// each loop and returns only the first to arrive, so an error from here reaches
+		// the operator only when the flag loop loses that race. The log line does not
+		// depend on the race.
+		log.Print("failed constructing flag push request: ", err)
+		return err, true
+	}
+	pushRequest.Header.Set("Content-Type", "application/json")
+
+	log.Print("pushing flags to: " + pushURI)
+	pushResponse, err, permanent := bridge.requestWithOauth(pushRequest)
+	if permanent {
+		return errors.New("Feature push Salesforce OAuth failure"), true
+	}
+	if err != nil {
+		return err, false
+	}
+	// Only the status matters here, so the body is discarded rather than read.
+	drainAndClose(pushResponse)
+
+	if pushResponse.StatusCode != 200 {
+		return fmt.Errorf("push flags expected 200 got %d", pushResponse.StatusCode), false
+	}
+
+	return nil, false
+}
+
+// featureLoop keeps the org's flag data current with LaunchDarkly's, by whichever means
+// the bridge is configured for. It returns when the bridge shuts down, or with the error
+// that stopped it.
 func (bridge *Bridge) featureLoop() error {
+	if bridge.streaming {
+		return bridge.streamLoop()
+	}
+
+	return bridge.pollLoop()
+}
+
+// pollLoop is featureLoop's polling form: it asks LaunchDarkly for all flag data every
+// flagPollInterval, and pushes what it gets when the ETag says it changed.
+func (bridge *Bridge) pollLoop() error {
 	etag := ""
 
 	pollURI := bridge.launchDarklyBaseURI + "/sdk/latest-all"
@@ -1143,39 +1276,14 @@ func (bridge *Bridge) featureLoop() error {
 				goto End
 			}
 
-			pushURI := bridge.salesforceURL + "store"
-			// A bytes.Reader rather than a bytes.Buffer, because requestWithOauth can send
-			// this request a second time after refreshing the token. Both give
-			// http.NewRequest enough to build a GetBody, so both replay as the code stands,
-			// but only the Reader is a read-only view of pollBytes. A Buffer is a writable
-			// staging area that http.NewRequest snapshots once, so a later write to it would
-			// leave the two attempts sending different bytes.
-			pushRequest, err := http.NewRequest("POST", pushURI, bytes.NewReader(pollBytes))
-			if err != nil {
-				// Logged as well as returned, which is not redundant. run() reads one
-				// error from each loop and returns only the first to arrive, so an
-				// error from here reaches the operator only when this loop loses that
-				// race. The log line does not depend on the race.
-				log.Print("failed constructing flag push request: ", err)
+			err, permanent := bridge.pushFlags(bridge.salesforceURL+"store", pollBytes)
+			if permanent {
 				return err
 			}
-			pushRequest.Header.Set("Content-Type", "application/json")
-
-			log.Print("pushing flags to: " + pushURI)
-			pushResponse, err, permanent := bridge.requestWithOauth(pushRequest)
-			if permanent {
-				return errors.New("Feature push Salesforce OAuth failure")
-			}
 			if err != nil {
-				etag = ""
+				// The ETag stays unset, so the next poll fetches the data again rather
+				// than being told nothing changed while the org still holds the old set.
 				log.Print("failed pushing flags to salesforce: ", err)
-				goto End
-			}
-			// Only the status matters here, so the body is discarded rather than read.
-			drainAndClose(pushResponse)
-
-			if pushResponse.StatusCode != 200 {
-				log.Print("push flags expected 200 got ", pushResponse.StatusCode)
 				goto End
 			}
 
