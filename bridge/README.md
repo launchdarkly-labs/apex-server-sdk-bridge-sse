@@ -267,6 +267,10 @@ Nothing changes on the Apex side. The stream feeds the same `store` endpoint wit
 document a poll would have pushed, so the org and the bridge can still be upgraded in
 either order.
 
+To watch it work, deploy the Visualforce page in [`examples/flag-demo`](../examples/flag-demo):
+it evaluates a flag with the SDK and shows the result, so a change saved in LaunchDarkly
+appears on the next reload.
+
 ### What the stream costs
 
 Streaming replaces a poll every 30 seconds with a push per change, which for most orgs is
